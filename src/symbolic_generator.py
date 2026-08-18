@@ -61,7 +61,8 @@ class SymbolicGenerator:
         if actuated_dofs is None:
             self.torque_order = self.state_order[self.nq:]
         else:
-            self.torque_order = self.state_order[self.nq:][actuated_dofs]
+            velocity_order = np.asarray(self.state_order[self.nq:], dtype=object)
+            self.torque_order = velocity_order[actuated_dofs].tolist()
 
         # Create directory to save files to if it doesn't exist
         self.write_files = write_files
