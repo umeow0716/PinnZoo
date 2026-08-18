@@ -2,6 +2,7 @@ import pinocchio as pin
 import pinocchio.casadi as cpin
 import casadi as cs
 from pinocchio.robot_wrapper import RobotWrapper
+import json
 import sys, os
 import numpy as np
 from enum import Enum
@@ -11,10 +12,15 @@ KinematicsOrientation = Enum('KinematicsOrientation', ['NONE', 'Quaternion', 'Ax
 
 class SymbolicGenerator:
     def __init__(self, urdf_path, gen_dir = "./generated_code", 
-                 kinematics_bodies = [], floating = False, mesh_dir=".", actuated_dofs = None, kinematics_ori = KinematicsOrientation.NONE,
-                 write_files = True):
+                 kinematics_bodies = None, floating = False, mesh_dir=".",
+                 actuated_dofs = None, actuated_joints = None,
+                 kinematics_ori = KinematicsOrientation.NONE, write_files = True):
         # Load the URDF model
         self.urdf_path = urdf_path
+        if kinematics_bodies is None:
+            kinematics_bodies = []
+        if actuated_dofs is not None and actuated_joints is not None:
+            raise ValueError("Use either actuated_dofs or actuated_joints, not both")
         if floating:
             self.model = RobotWrapper.BuildFromURDF(urdf_path, mesh_dir, root_joint = pin.JointModelFreeFlyer()).model
         else:
@@ -57,12 +63,21 @@ class SymbolicGenerator:
         # and define the state vector order
         self.define_state_order()
 
-        # Define actuators
+        # Define actuators. Name-based selection is preferred because Pinocchio's
+        # generalized-velocity layout is an implementation detail, not a robot API.
+        velocity_order = np.asarray(self.state_order[self.nq:], dtype=object)
+        if actuated_joints is not None:
+            actuated_dofs = self._resolve_actuated_joint_dofs(actuated_joints)
         if actuated_dofs is None:
-            self.torque_order = self.state_order[self.nq:]
+            self.actuated_dofs = list(range(self.nv))
         else:
-            velocity_order = np.asarray(self.state_order[self.nq:], dtype=object)
-            self.torque_order = velocity_order[actuated_dofs].tolist()
+            self.actuated_dofs = [int(index) for index in actuated_dofs]
+            if len(self.actuated_dofs) != len(set(self.actuated_dofs)):
+                raise ValueError("Actuated DoF list contains duplicate indices")
+            invalid = [index for index in self.actuated_dofs if not 0 <= index < self.nv]
+            if invalid:
+                raise ValueError(f"Actuated DoF indices out of range: {invalid}")
+        self.torque_order = velocity_order[self.actuated_dofs].tolist()
 
         # Create directory to save files to if it doesn't exist
         self.write_files = write_files
@@ -94,6 +109,25 @@ class SymbolicGenerator:
                 sys.exit()
         self.kinematics_bodies = kinematics_bodies
         self.kinematics_ori = kinematics_ori
+
+    def _resolve_actuated_joint_dofs(self, joint_names):
+        joint_names = list(joint_names)
+        if len(joint_names) != len(set(joint_names)):
+            raise ValueError("Actuated joint list contains duplicate names")
+
+        dofs = []
+        for name in joint_names:
+            if not self.model.existJointName(name):
+                raise ValueError(f"Actuated joint {name!r} not found in Pinocchio model")
+            joint_id = self.model.getJointId(name)
+            joint = self.model.joints[joint_id]
+            if joint.nv != 1:
+                raise ValueError(
+                    f"Actuated joint {name!r} must contribute exactly one velocity DoF, "
+                    f"got nv={joint.nv}"
+                )
+            dofs.append(int(joint.idx_v))
+        return dofs
 
     def generate(self):
         print("\nGenerating code")
@@ -286,46 +320,97 @@ class SymbolicGenerator:
         print("Generated kinematics")
 
     def generate_order_functions(self):
+        config_order = self.state_order[:self.nq]
+        velocity_order = self.state_order[self.nq:]
+        joint_metadata = []
+        for joint_id in range(1, self.model.njoints):  # skip Pinocchio universe
+            joint = self.model.joints[joint_id]
+            joint_metadata.append(
+                (
+                    self.model.names[joint_id],
+                    int(joint.idx_q),
+                    int(joint.idx_v),
+                    int(joint.nq),
+                    int(joint.nv),
+                )
+            )
+
+        def c_string(value):
+            return json.dumps(str(value))
+
+        def write_string_array(f, symbol, values):
+            f.write(f'const char* {symbol}[] = {{\n')
+            for value in values:
+                f.write(f'    {c_string(value)},\n')
+            f.write('    NULL\n};\n\n')
+
+        def write_int_array(f, symbol, values):
+            serialized = ', '.join(str(int(value)) for value in values) or '0'
+            f.write(f'const int {symbol}[] = {{{serialized}}};\n')
+
         with open('vector_orders.c', 'w') as f:
-            f.write('#include <stdio.h>\n\n')
-            f.write('const char* config_names[] = {\n')
-            for name in self.state_order[:self.nq]:
-                f.write(f'    "{name}",\n')
-            f.write('    NULL\n};\n\n')
-            f.write('const char* vel_names[] = {\n')
-            for name in self.state_order[self.nq:]:
-                f.write(f'    "{name}",\n')
-            f.write('    NULL\n};\n\n')
-            f.write('const char* torque_names[] = {\n')
-            for name in self.torque_order:
-                f.write(f'    "{name}",\n')
-            f.write('    NULL\n};\n\n')
-            f.write('const char* kinematics_bodies[] = {\n')
-            for name in self.kinematics_bodies:
-                f.write(f'    "{name}",\n')
-            f.write('    NULL\n};\n\n')
-            f.write('const char** get_config_order() {\n')
-            f.write('    return config_names;\n')
+            f.write('#include <stddef.h>\n')
+            f.write('#include <string.h>\n\n')
+            write_string_array(f, 'config_names', config_order)
+            write_string_array(f, 'vel_names', velocity_order)
+            write_string_array(f, 'torque_names', self.torque_order)
+            write_string_array(f, 'kinematics_bodies', self.kinematics_bodies)
+            write_string_array(f, 'joint_names', [item[0] for item in joint_metadata])
+            write_int_array(f, 'joint_q_indices', [item[1] for item in joint_metadata])
+            write_int_array(f, 'joint_v_indices', [item[2] for item in joint_metadata])
+            write_int_array(f, 'joint_nq', [item[3] for item in joint_metadata])
+            write_int_array(f, 'joint_nv', [item[4] for item in joint_metadata])
+            f.write('\n')
+
+            f.write('static int find_name(const char* const* names, const char* name) {\n')
+            f.write('    if (name == NULL) return -1;\n')
+            f.write('    for (int i = 0; names[i] != NULL; ++i) {\n')
+            f.write('        if (strcmp(names[i], name) == 0) return i;\n')
+            f.write('    }\n')
+            f.write('    return -1;\n')
+            f.write('}\n\n')
+
+            f.write('int get_vector_order_api_version(void) { return 2; }\n')
+            kinematics_body_size = {
+                KinematicsOrientation.NONE: 3,
+                KinematicsOrientation.Quaternion: 7,
+                KinematicsOrientation.AxisAngle: 6,
+            }[self.kinematics_ori]
+            f.write(
+                f'int get_kinematics_body_size(void) {{ return {kinematics_body_size}; }}\n'
+            )
+            f.write('const char** get_config_order(void) { return config_names; }\n')
+            f.write('const char** get_vel_order(void) { return vel_names; }\n')
+            f.write('const char** get_torque_order(void) { return torque_names; }\n')
+            f.write('const char** get_kinematics_bodies(void) { return kinematics_bodies; }\n')
+            f.write('const char** get_joint_names(void) { return joint_names; }\n')
+            f.write('int get_config_index(const char* name) { return find_name(config_names, name); }\n')
+            f.write('int get_vel_index(const char* name) { return find_name(vel_names, name); }\n')
+            f.write('int get_torque_index(const char* name) { return find_name(torque_names, name); }\n')
+            f.write(f'int get_joint_count(void) {{ return {len(joint_metadata)}; }}\n')
+            f.write('int get_joint_q_index(const char* name) {\n')
+            f.write('    int index = find_name(joint_names, name);\n')
+            f.write('    return index < 0 ? -1 : joint_q_indices[index];\n')
             f.write('}\n')
-            f.write('const char** get_vel_order() {\n')
-            f.write('    return vel_names;\n')
+            f.write('int get_joint_v_index(const char* name) {\n')
+            f.write('    int index = find_name(joint_names, name);\n')
+            f.write('    return index < 0 ? -1 : joint_v_indices[index];\n')
             f.write('}\n')
-            f.write('const char** get_torque_order() {\n')
-            f.write('    return torque_names;\n')
+            f.write('int get_joint_nq(const char* name) {\n')
+            f.write('    int index = find_name(joint_names, name);\n')
+            f.write('    return index < 0 ? -1 : joint_nq[index];\n')
             f.write('}\n')
-            f.write('const char** get_kinematics_bodies() {\n')
-            f.write('    return kinematics_bodies;\n')
+            f.write('int get_joint_nv(const char* name) {\n')
+            f.write('    int index = find_name(joint_names, name);\n')
+            f.write('    return index < 0 ? -1 : joint_nv[index];\n')
             f.write('}\n')
-            f.write('const char* get_urdf_path() {\n')
 
             # Get urdf relative path
-            urdf_full_path = self.orig_dir+"/"+self.urdf_path
+            urdf_full_path = self.orig_dir + "/" + self.urdf_path
             parts = urdf_full_path.split(os.sep)
             models_index = len(parts) - 1 - parts[::-1].index('models')
             subpath = os.sep.join(parts[models_index + 1:])
-            
-            f.write(f'    return "{subpath}";\n')
-            f.write('}\n');
+            f.write(f'const char* get_urdf_path(void) {{ return {c_string(subpath)}; }}\n')
 
 
     def define_state_order(self):
