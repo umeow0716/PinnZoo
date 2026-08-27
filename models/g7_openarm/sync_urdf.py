@@ -1,141 +1,144 @@
-"""Synchronize the PinnZoo G7 URDF from the canonical project URDF.
+#!/usr/bin/env python3
+"""Convert a URDF into the form expected by PinnZoo/Pinocchio code generation.
 
-PinnZoo/Pinocchio intentionally represents the four wheel joints as very-wide
-revolute joints instead of URDF ``continuous`` joints. Pinocchio otherwise uses
-its cos/sin two-configuration representation for continuous joints, while this
-code generator supports scalar or free-flyer configuration blocks.
+Only two semantic transforms are performed:
+1. URDF `continuous` joints -> scalar `revolute` joints with wide limits.
+2. Mesh paths -> `meshes/<basename>` (e.g. `../meshes/foo.stl` -> `meshes/foo.stl`).
 
-All other robot semantics are copied from the source URDF. Mesh paths are made
-relative to this PinnZoo model directory and the MuJoCo-only compiler extension
-is removed.
+Uses only the Python standard library.
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
-import difflib
 from pathlib import Path
+import sys
 import xml.etree.ElementTree as ET
 
-WHEEL_JOINTS = frozenset(
-    {
-        "AMR_FLW_joint",
-        "AMR_FRW_joint",
-        "AMR_RLW_joint",
-        "AMR_RRW_joint",
-    }
-)
-WHEEL_LIMIT = 1_000_000.0
-LOCAL_URDF = Path(__file__).with_name("g7_openarm.urdf")
+DEFAULT_WIDE_LIMIT = 1_000_000.0
 
 
-def _prepare_tree(source: Path) -> ET.ElementTree:
-    tree = ET.parse(source)
+def _mesh_basename(filename: str) -> str:
+    """Return the final path component using URDF-style forward slashes."""
+    normalized = filename.replace("\\", "/")
+    return normalized.rsplit("/", 1)[-1]
+
+
+def convert_urdf(source: Path, target: Path, wide_limit: float) -> tuple[int, int]:
+    if wide_limit <= 0:
+        raise ValueError("wide_limit must be > 0")
+
+    # insert_comments=True keeps XML comments when possible.
+    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+    tree = ET.parse(source, parser=parser)
     root = tree.getroot()
+
     if root.tag != "robot":
-        raise ValueError(f"Expected URDF <robot> root in {source}")
+        raise ValueError(f"Expected URDF <robot> root, got <{root.tag}>")
 
-    for mujoco_tag in list(root.findall("mujoco")):
-        root.remove(mujoco_tag)
+    converted_joints = 0
+    rewritten_meshes = 0
 
+    # PinnZoo's symbolic generator accepts scalar joints (nq == 1) and the
+    # 7/6 free-flyer block. Pinocchio represents URDF continuous joints with
+    # nq == 2 (cos(theta), sin(theta)), so make them wide revolute joints.
+    for joint in root.findall("joint"):
+        if joint.get("type") != "continuous":
+            continue
+
+        joint.set("type", "revolute")
+        limit = joint.find("limit")
+        if limit is None:
+            limit = ET.SubElement(joint, "limit")
+
+        # Preserve any existing effort/velocity attributes; only add/replace
+        # the lower/upper bounds required by a revolute joint.
+        limit.set("lower", str(-wide_limit))
+        limit.set("upper", str(wide_limit))
+        converted_joints += 1
+
+    # Match PinnZoo's model directory layout: URDF and meshes/ are siblings.
     for mesh in root.findall(".//mesh"):
         filename = mesh.get("filename")
-        if filename:
-            mesh.set("filename", f"meshes/{Path(filename).name}")
+        if not filename:
+            continue
 
-    seen_wheels: set[str] = set()
-    unsupported_continuous: list[str] = []
-    for joint in root.findall("joint"):
-        name = joint.get("name") or ""
-        joint_type = joint.get("type")
-        if name in WHEEL_JOINTS:
-            seen_wheels.add(name)
-            if joint_type not in {"continuous", "revolute"}:
-                raise ValueError(
-                    f"Wheel joint {name!r} must be continuous/revolute, got {joint_type!r}"
-                )
-            joint.set("type", "revolute")
-            limit = joint.find("limit")
-            if limit is None:
-                limit = ET.SubElement(joint, "limit")
-            limit.set("lower", str(-WHEEL_LIMIT))
-            limit.set("upper", str(WHEEL_LIMIT))
-        elif joint_type == "continuous":
-            unsupported_continuous.append(name)
+        new_filename = f"meshes/{_mesh_basename(filename)}"
+        if filename != new_filename:
+            mesh.set("filename", new_filename)
+            rewritten_meshes += 1
 
-    missing = sorted(WHEEL_JOINTS - seen_wheels)
-    if missing:
-        raise ValueError(f"Canonical URDF is missing expected wheel joints: {missing}")
-    if unsupported_continuous:
-        raise ValueError(
-            "PinnZoo generator does not support additional continuous joints: "
-            f"{unsupported_continuous}"
-        )
-
-    ET.indent(tree, space="  ")
-    return tree
-
-
-def _semantic_lines(root: ET.Element) -> list[str]:
-    """Stable structural representation that ignores XML attribute ordering."""
-    lines: list[str] = []
-
-    def visit(element: ET.Element, depth: int) -> None:
-        attrs = " ".join(f"{key}={value!r}" for key, value in sorted(element.attrib.items()))
-        text = (element.text or "").strip()
-        lines.append(f"{'  ' * depth}<{element.tag} {attrs}> {text}".rstrip())
-        for child in element:
-            visit(child, depth + 1)
-
-    visit(root, 0)
-    return lines
-
-
-def check(source: Path, target: Path = LOCAL_URDF) -> None:
-    expected = _prepare_tree(source).getroot()
-    actual = ET.parse(target).getroot()
-    expected_lines = _semantic_lines(expected)
-    actual_lines = _semantic_lines(actual)
-    if expected_lines != actual_lines:
-        diff = "\n".join(
-            difflib.unified_diff(
-                actual_lines,
-                expected_lines,
-                fromfile=str(target),
-                tofile=f"normalized:{source}",
-                lineterm="",
-            )
-        )
+    # Validation: the output should contain no continuous joint and every mesh
+    # path should point into meshes/.
+    remaining_continuous = [
+        joint.get("name", "<unnamed>")
+        for joint in root.findall("joint")
+        if joint.get("type") == "continuous"
+    ]
+    if remaining_continuous:
         raise RuntimeError(
-            "PinnZoo G7 URDF has drifted from the canonical source outside the "
-            f"approved wheel/mesh/MuJoCo transforms:\n{diff}"
+            "continuous joints remain after conversion: "
+            + ", ".join(remaining_continuous)
         )
 
+    invalid_meshes = [
+        mesh.get("filename", "")
+        for mesh in root.findall(".//mesh")
+        if mesh.get("filename") and not mesh.get("filename", "").startswith("meshes/")
+    ]
+    if invalid_meshes:
+        raise RuntimeError(
+            "mesh paths outside meshes/ remain after conversion: "
+            + ", ".join(invalid_meshes)
+        )
 
-def write(source: Path, target: Path = LOCAL_URDF) -> None:
-    tree = _prepare_tree(source)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    ET.indent(tree, space="  ")
     tree.write(target, encoding="utf-8", xml_declaration=True)
+    return converted_joints, rewritten_meshes
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("source_urdf", type=Path, help="canonical G7 project URDF")
-    parser.add_argument(
-        "--write",
-        action="store_true",
-        help="overwrite PinnZoo's local URDF with the normalized canonical source",
+def default_output_path(source: Path) -> Path:
+    return source.with_name(f"{source.stem}_pinnzoo{source.suffix}")
+
+
+def main() -> int:
+    argp = argparse.ArgumentParser(
+        description="Convert a URDF to PinnZoo-compatible continuous-joint and mesh-path conventions."
     )
-    args = parser.parse_args()
+    argp.add_argument("input", type=Path, help="source URDF")
+    argp.add_argument(
+        "output",
+        nargs="?",
+        type=Path,
+        help="output URDF (default: <input_stem>_pinnzoo.urdf)",
+    )
+    argp.add_argument(
+        "--wide-limit",
+        type=float,
+        default=DEFAULT_WIDE_LIMIT,
+        metavar="RAD",
+        help=f"lower/upper magnitude for converted continuous joints (default: {DEFAULT_WIDE_LIMIT:g})",
+    )
+    args = argp.parse_args()
 
-    source = args.source_urdf.expanduser().resolve()
+    source = args.input.expanduser()
+    target = (args.output or default_output_path(source)).expanduser()
+
     if not source.is_file():
-        raise FileNotFoundError(source)
-    if args.write:
-        write(source)
-    check(source)
-    print("G7 PinnZoo URDF matches canonical source after approved transforms.")
+        argp.error(f"input URDF does not exist: {source}")
+
+    try:
+        joint_count, mesh_count = convert_urdf(source, target, args.wide_limit)
+    except (ET.ParseError, OSError, ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"output: {target}")
+    print(f"continuous -> revolute: {joint_count}")
+    print(f"mesh paths rewritten: {mesh_count}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
