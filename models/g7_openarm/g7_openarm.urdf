@@ -1,8 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
 <robot name="g7_openarm">
-  <mujoco>
-    <compiler meshdir="../meshes" balanceinertia="true" discardvisual="false" fusestatic="false" />
-  </mujoco>
   <link name="AMR_base_link">
     <inertial>
       <origin xyz="-0.00420581 -0.00009293 0.03202295" rpy="0 0 0" />
