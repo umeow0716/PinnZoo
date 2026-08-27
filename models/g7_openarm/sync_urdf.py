@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Convert a URDF into the form expected by PinnZoo/Pinocchio code generation.
+"""PinnZoo URDF converter v2.
 
-Only two semantic transforms are performed:
+Convert a URDF into the form expected by PinnZoo/Pinocchio code generation.
+
+Only three semantic transforms are performed:
 1. URDF `continuous` joints -> scalar `revolute` joints with wide limits.
 2. Mesh paths -> `meshes/<basename>` (e.g. `../meshes/foo.stl` -> `meshes/foo.stl`).
+3. Remove top-level `<mujoco>...</mujoco>` extension blocks.
 
 Uses only the Python standard library.
 """
@@ -24,7 +27,7 @@ def _mesh_basename(filename: str) -> str:
     return normalized.rsplit("/", 1)[-1]
 
 
-def convert_urdf(source: Path, target: Path, wide_limit: float) -> tuple[int, int]:
+def convert_urdf(source: Path, target: Path, wide_limit: float) -> tuple[int, int, int]:
     if wide_limit <= 0:
         raise ValueError("wide_limit must be > 0")
 
@@ -38,6 +41,7 @@ def convert_urdf(source: Path, target: Path, wide_limit: float) -> tuple[int, in
 
     converted_joints = 0
     rewritten_meshes = 0
+    removed_mujoco_blocks = 0
 
     # PinnZoo's symbolic generator accepts scalar joints (nq == 1) and the
     # 7/6 free-flyer block. Pinocchio represents URDF continuous joints with
@@ -68,8 +72,14 @@ def convert_urdf(source: Path, target: Path, wide_limit: float) -> tuple[int, in
             mesh.set("filename", new_filename)
             rewritten_meshes += 1
 
-    # Validation: the output should contain no continuous joint and every mesh
-    # path should point into meshes/.
+    # PinnZoo does not need MuJoCo-specific URDF extension blocks. Remove only
+    # top-level <mujoco> blocks; normal URDF content is otherwise preserved.
+    for mujoco in list(root.findall("mujoco")):
+        root.remove(mujoco)
+        removed_mujoco_blocks += 1
+
+    # Validation: no continuous joints, all mesh paths are under meshes/, and
+    # no top-level MuJoCo extension block remains.
     remaining_continuous = [
         joint.get("name", "<unnamed>")
         for joint in root.findall("joint")
@@ -92,10 +102,13 @@ def convert_urdf(source: Path, target: Path, wide_limit: float) -> tuple[int, in
             + ", ".join(invalid_meshes)
         )
 
+    if root.findall("mujoco"):
+        raise RuntimeError("top-level <mujoco> block remains after conversion")
+
     target.parent.mkdir(parents=True, exist_ok=True)
     ET.indent(tree, space="  ")
     tree.write(target, encoding="utf-8", xml_declaration=True)
-    return converted_joints, rewritten_meshes
+    return converted_joints, rewritten_meshes, removed_mujoco_blocks
 
 
 def default_output_path(source: Path) -> Path:
@@ -104,7 +117,7 @@ def default_output_path(source: Path) -> Path:
 
 def main() -> int:
     argp = argparse.ArgumentParser(
-        description="Convert a URDF to PinnZoo-compatible continuous-joint and mesh-path conventions."
+        description="Convert a URDF to PinnZoo-compatible joint, mesh-path, and MuJoCo-extension conventions."
     )
     argp.add_argument("input", type=Path, help="source URDF")
     argp.add_argument(
@@ -129,7 +142,7 @@ def main() -> int:
         argp.error(f"input URDF does not exist: {source}")
 
     try:
-        joint_count, mesh_count = convert_urdf(source, target, args.wide_limit)
+        joint_count, mesh_count, mujoco_count = convert_urdf(source, target, args.wide_limit)
     except (ET.ParseError, OSError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -137,6 +150,7 @@ def main() -> int:
     print(f"output: {target}")
     print(f"continuous -> revolute: {joint_count}")
     print(f"mesh paths rewritten: {mesh_count}")
+    print(f"<mujoco> blocks removed: {mujoco_count}")
     return 0
 
 
