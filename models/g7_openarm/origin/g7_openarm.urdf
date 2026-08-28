@@ -617,9 +617,9 @@
     <origin xyz="-0.0284000000012584 -0.065 0" rpy="0 0 0" />
     <parent link="R_link1" />
     <child link="R_link2" />
-    <axis xyz="1 0 0" />
+    <axis xyz="-1 0 0" />
     <dynamics damping="0.4" friction="0.1" />
-    <limit effort="40" lower="-3.3161253267948965" upper="0.17453267320510335" velocity="16.754666" />
+    <limit effort="40" lower="-0.17453267320510335" upper="3.3161253267948965" velocity="16.754666" />
   </joint>
   <link name="R_link3">
     <inertial>
