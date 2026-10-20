@@ -32,6 +32,8 @@ ACTUATED_JOINTS = [
     "R_5_joint",
     "R_6_joint",
     "R_7_joint",
+    "HEAD_yaw_joint",
+    "HEAD_pitch_joint",
 ]
 
 symb_gen = SymbolicGenerator(
