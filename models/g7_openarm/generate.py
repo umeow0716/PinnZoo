@@ -39,7 +39,7 @@ ACTUATED_JOINTS = [
 symb_gen = SymbolicGenerator(
     "g7_openarm.urdf",
     floating=True,
-    kinematics_bodies=["L_tcp", "R_tcp"],
+    kinematics_bodies=["L_tcp", "R_tcp", "HEAD_color_link"],
     actuated_joints=ACTUATED_JOINTS,
     kinematics_ori=KinematicsOrientation.Quaternion,
     gen_dir="./generated_code/g7_openarm_quat",
